@@ -41,7 +41,16 @@ cat > "$PLIST" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# bootout returns before the old agent has exited; wait for it before loading the new one.
+for _ in $(seq 1 20); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
+for attempt in 1 2 3 4 5; do
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then break; fi
+  if [ "$attempt" = 5 ]; then echo "launchctl couldn't load $PLIST" >&2; exit 1; fi
+  sleep 1
+done
 
 LINKED=""
 for dir in /opt/homebrew/bin /usr/local/bin; do
