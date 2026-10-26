@@ -1,0 +1,1126 @@
+#!/usr/bin/python3
+"""codex-auto-resume — resume an unfinished Codex Desktop task after a usage limit resets.
+
+Mechanism (all supported/local, no UI automation):
+  * State is read through a short-lived private `codex app-server` (JSON-RPC over stdio):
+    thread/read, thread/turns/list, thread/goal/get, account/rateLimits/read.
+  * A usage limit is detected from the structured turn error `codexErrorInfo == usageLimitExceeded`
+    (or a thread goal in status `usageLimited`).
+  * Resuming = `codex queue --thread <id> --message <prompt>` (Codex's own per-thread message queue,
+    drained by whichever Codex process owns the thread — normally Codex Desktop), plus, for goal
+    threads, flipping the goal back to `active` so Codex's native goal loop continues by itself.
+  * If the thread is not loaded anywhere, `open -g codex://threads/<id>` makes Codex Desktop load it.
+
+Only one task can be armed at a time. Nothing is sent unless the armed thread's latest turn ended
+with a usage-limit error (or the user runs `resume-now`).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import logging
+import logging.handlers
+import os
+import queue
+import re
+import select
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+LABEL = "local.codex-auto-resume"
+HOME = Path.home()
+APP_DIR = HOME / "Library/Application Support/CodexAutoResume"
+LOG_DIR = HOME / "Library/Logs/CodexAutoResume"
+STATE_PATH = APP_DIR / "state.json"
+CONFIG_PATH = APP_DIR / "config.json"
+LOCK_PATH = APP_DIR / "state.lock"
+PID_PATH = APP_DIR / "daemon.pid"
+LOG_PATH = LOG_DIR / "codex-auto-resume.log"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(HOME / ".codex")))
+MARKER = "[codex-auto-resume]"
+
+DEFAULT_CONFIG = {
+    "codex_cli": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "codex_app_process": "ChatGPT",
+    # Safety caps (per armed task).
+    "max_resumes": 20,
+    # Polling cadence while armed (seconds). Nothing is polled while disarmed.
+    "poll_working_secs": 120,
+    "poll_idle_secs": 300,
+    "poll_waiting_secs": 900,
+    "poll_resuming_secs": 20,
+    # Wait this long after the reported reset before resuming.
+    "reset_grace_secs": 90,
+    # Backoff (seconds) used when no reset time is known or a resume hits the limit again.
+    "backoff_secs": [600, 1200, 2400, 3600, 7200],
+    # How long to wait for a queued continuation to start before trying again / giving up.
+    "resume_verify_secs": 240,
+    # Power: prevent idle sleep while the armed task is working; while waiting for a reset (AC power
+    # only, and only when the reset is less than keep_awake_max_wait_secs away).
+    "keep_awake_while_working": True,
+    "keep_awake_while_waiting_on_ac": True,
+    "keep_awake_max_wait_secs": 6 * 3600,
+    "notifications": True,
+    "continuation_prompt": (
+        MARKER + " Your Codex usage limit has reset, so you can continue. Resume the unfinished task from "
+        "where you stopped. Review the existing conversation, the repository state (e.g. git status / git diff), "
+        "any pending TODOs or plan, and the work already completed. Continue autonomously until the requested "
+        "task is complete. Do not redo completed work. Run the relevant checks/tests before considering the task "
+        "finished, and state clearly in your final message whether everything is done."
+    ),
+    "goal_continuation_prompt": (
+        MARKER + " Your Codex usage limit has reset. Continue working toward the active thread goal from where "
+        "you stopped. Review the conversation, the repository state and the work already completed; do not redo "
+        "completed work. Keep going autonomously, and only mark the goal complete after the completion audit "
+        "passes and the relevant checks/tests have been run."
+    ),
+    "checkpoint_instruction": (
+        " Maintain a concise checkpoint file at .codex/resume.md in the working directory (original objective, "
+        "completed work, remaining work, current blockers, files modified, checks/tests still required) ending "
+        "with a line that is exactly `Status: COMPLETE` or `Status: IN PROGRESS`. Update it before you end "
+        "each turn."
+    ),
+}
+
+TERMINAL_GOAL_STOP = {"blocked": "the goal is blocked", "paused": "the goal was paused",
+                      "budgetLimited": "the goal hit its token budget"}
+
+log = logging.getLogger("codex-auto-resume")
+
+
+# --------------------------------------------------------------------------------------------- utils
+
+def now() -> float:
+    return time.time()
+
+
+def fmt_time(ts) -> str:
+    if not ts:
+        return "-"
+    d = dt.datetime.fromtimestamp(ts)
+    if d.date() == dt.date.today():
+        return d.strftime("%H:%M")
+    return d.strftime("%a %d %b %H:%M")
+
+
+def fmt_delta(secs) -> str:
+    secs = int(max(0, secs))
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return "%dh%02dm" % (h, m) if h else "%dm" % max(m, 1 if secs else 0)
+
+
+def setup_logging(daemon: bool) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if daemon:
+        h = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
+    else:
+        h = logging.handlers.WatchedFileHandler(LOG_PATH)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # keep running on a broken config, but say so
+        log.warning("config.json unreadable (%s); using defaults", e)
+    return cfg
+
+
+def notify(cfg: dict, title: str, message: str) -> None:
+    log.info("notify: %s — %s", title, message)
+    if not cfg.get("notifications", True):
+        return
+    script = 'display notification %s with title "Codex Auto-Resume" subtitle %s' % (
+        json.dumps(message), json.dumps(title))
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", script], timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("notification failed: %s", e)
+
+
+# --------------------------------------------------------------------------------------------- state
+
+def default_state() -> dict:
+    return {"armed": False, "phase": "disarmed", "generation": 0, "history": []}
+
+
+@contextlib.contextmanager
+def state_lock():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def load_state() -> dict:
+    try:
+        st = json.loads(STATE_PATH.read_text())
+        base = default_state()
+        base.update(st)
+        return base
+    except FileNotFoundError:
+        return default_state()
+    except Exception as e:
+        log.error("state.json unreadable (%s); starting disarmed", e)
+        return default_state()
+
+
+def save_state(st: dict) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    st["updated_at"] = now()
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2, sort_keys=True))
+    os.replace(tmp, STATE_PATH)
+
+
+@contextlib.contextmanager
+def mutate_state():
+    with state_lock():
+        st = load_state()
+        yield st
+        save_state(st)
+
+
+def add_event(st: dict, kind: str, detail: str = "") -> None:
+    st.setdefault("history", []).append({"ts": now(), "event": kind, "detail": detail})
+    st["history"] = st["history"][-100:]
+    log.info("[%s] %s %s", (st.get("thread_id") or "-")[:13], kind, detail)
+
+
+def signal_daemon() -> bool:
+    try:
+        pid = int(PID_PATH.read_text().strip())
+        os.kill(pid, signal.SIGUSR1)
+        return True
+    except Exception:
+        return False
+
+
+def daemon_pid():
+    try:
+        pid = int(PID_PATH.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+# -------------------------------------------------------------------------------------- app-server
+
+class AppServerError(Exception):
+    pass
+
+
+class AppServer:
+    """Minimal JSON-RPC client for a private, short-lived `codex app-server` (stdio)."""
+
+    def __init__(self, codex: str, timeout: float = 30):
+        if not os.path.exists(codex):
+            raise AppServerError("Codex CLI not found at %s" % codex)
+        self.timeout = timeout
+        self.p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+        self.responses: "queue.Queue[dict]" = queue.Queue()
+        self.next_id = 0
+        threading.Thread(target=self._reader, daemon=True).start()
+        self.call("initialize", {"clientInfo": {"name": "codex-auto-resume", "version": VERSION}})
+        self._send({"jsonrpc": "2.0", "method": "initialized"})
+
+    def _send(self, msg: dict) -> None:
+        assert self.p.stdin is not None
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+
+    def _reader(self) -> None:
+        assert self.p.stdout is not None
+        for line in self.p.stdout:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if "id" in m and ("result" in m or "error" in m):
+                self.responses.put(m)
+            elif "id" in m and "method" in m:  # server->client request: we never approve anything
+                try:
+                    self._send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "unsupported"}})
+                except Exception:
+                    pass
+        self.responses.put({"id": None, "error": {"message": "app-server exited"}})
+
+    def call(self, method: str, params=None):
+        self.next_id += 1
+        my = self.next_id
+        self._send({"jsonrpc": "2.0", "id": my, "method": method, "params": params})
+        deadline = now() + self.timeout
+        while True:
+            try:
+                m = self.responses.get(timeout=max(0.1, deadline - now()))
+            except queue.Empty:
+                raise AppServerError("%s timed out" % method)
+            if m.get("id") is None:
+                raise AppServerError(m["error"]["message"])
+            if m["id"] == my:
+                if "error" in m:
+                    raise AppServerError("%s: %s" % (method, m["error"].get("message")))
+                return m["result"]
+
+    def close(self) -> None:
+        try:
+            self.p.stdin.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+        try:
+            self.p.terminate()
+            self.p.wait(timeout=5)
+        except Exception:
+            self.p.kill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def error_code(err) -> str | None:
+    if not err:
+        return None
+    info = err.get("codexErrorInfo")
+    if isinstance(info, str):
+        return info
+    if isinstance(info, dict) and info:
+        return next(iter(info))
+    return "other"
+
+
+def summarize_turn(t: dict) -> dict:
+    users = [i for i in t.get("items", []) if i.get("type") == "userMessage"]
+    first_text = ""
+    if users:
+        for c in users[0].get("content") or []:
+            if c.get("type") == "text":
+                first_text = c.get("text") or ""
+                break
+    err = t.get("error")
+    return {
+        "id": t["id"],
+        "status": t.get("status"),
+        "error_code": error_code(err),
+        "error_message": (err or {}).get("message"),
+        "started_at": t.get("startedAt"),
+        "completed_at": t.get("completedAt"),
+        "by_helper": first_text.startswith(MARKER),
+        "has_user_message": bool(users),
+    }
+
+
+def sqlite_ro(db: Path, sql: str, args=()):
+    for attempt in range(3):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+            try:
+                return con.execute(sql, args).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def thread_archived(tid: str, path: str | None):
+    rows = sqlite_ro(CODEX_HOME / "state_5.sqlite", "select archived from threads where id=?", (tid,))
+    if rows:
+        return bool(rows[0][0])
+    return bool(path and "/archived_sessions/" in path)
+
+
+def pending_queue_items(tid: str):
+    rows = sqlite_ro(CODEX_HOME / "queue_1.sqlite",
+                     "select id, created_at_ms from queued_items where thread_id=? order by queue_order", (tid,))
+    return None if rows is None else [r[0] for r in rows]
+
+
+def lock_holders(tid: str) -> list:
+    lock = CODEX_HOME / "thread-writer-locks" / ("%s.lock" % tid)
+    if not lock.exists():
+        return []
+    r = subprocess.run(["/usr/sbin/lsof", "-t", str(lock)], capture_output=True, text=True)
+    return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+
+
+def codex_app_running(cfg: dict) -> bool:
+    return subprocess.run(["/usr/bin/pgrep", "-x", cfg["codex_app_process"]],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
+def short_title(th: dict) -> str:
+    """Thread name, or the first line of its preview; truncated so logs never hold conversation content."""
+    if th.get("name"):
+        return th["name"][:70]
+    lines = (th.get("preview") or "").strip().splitlines()
+    return lines[0][:70] if lines else ""
+
+
+def read_snapshot(srv: AppServer, tid: str) -> dict:
+    snap: dict = {"thread_id": tid, "taken_at": now()}
+    try:
+        th = srv.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
+    except AppServerError as e:
+        if "not found" in str(e).lower():
+            snap["missing"] = True
+            return snap
+        raise
+    snap["missing"] = False
+    snap["title"] = short_title(th)
+    snap["cwd"] = th.get("cwd")
+    snap["path"] = th.get("path")
+    snap["archived"] = thread_archived(tid, th.get("path"))
+    turns = srv.call("thread/turns/list", {"threadId": tid, "limit": 3}).get("data") or []
+    snap["turns"] = [summarize_turn(t) for t in turns]  # newest first
+    snap["latest"] = snap["turns"][0] if snap["turns"] else None
+    try:
+        snap["goal"] = srv.call("thread/goal/get", {"threadId": tid}).get("goal")
+    except AppServerError as e:
+        log.warning("goal read failed: %s", e)
+        snap["goal"] = None
+        snap["goal_unknown"] = True
+    return snap
+
+
+def analyze_rate_limits(rl: dict | None) -> dict:
+    out = {"allowed": None, "reset_at": None, "windows": []}
+    if not rl:
+        return out
+    out["allowed"] = rl.get("ordinaryUsageAllowed")
+    snaps = []
+    if rl.get("rateLimits"):
+        snaps.append(rl["rateLimits"])
+    snaps += list((rl.get("rateLimitsByLimitId") or {}).values())
+    exhausted, t = [], now()
+    for s in snaps:
+        for key in ("primary", "secondary"):
+            w = s.get(key)
+            if not w or not w.get("resetsAt"):
+                continue
+            out["windows"].append({"window": key, "used": w.get("usedPercent"), "resets_at": w["resetsAt"],
+                                   "mins": w.get("windowDurationMins")})
+            if (w.get("usedPercent") or 0) >= 100 and w["resetsAt"] > t:
+                exhausted.append(w["resetsAt"])
+    if exhausted:
+        out["reset_at"] = max(exhausted)
+    return out
+
+
+_MONTHS = "%b %d, %Y %I:%M %p"
+
+
+def parse_try_again(message: str | None):
+    """Parse '... try again at Oct 8th, 2026 2:51 AM.' or '... try again at 5:57 PM.' (local time)."""
+    if not message:
+        return None
+    m = re.search(r"try again at (.+?)\.?\s*$", message.strip())
+    if not m:
+        return None
+    text = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", m.group(1).strip())
+    for fmt in (_MONTHS, "%B %d, %Y %I:%M %p"):
+        try:
+            return dt.datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            pass
+    try:
+        tm = dt.datetime.strptime(text, "%I:%M %p").time()
+        d = dt.datetime.combine(dt.date.today(), tm)
+        if d.timestamp() < now() - 60:
+            d += dt.timedelta(days=1)
+        return d.timestamp()
+    except ValueError:
+        return None
+
+
+def read_checkpoint(cwd: str | None):
+    if not cwd:
+        return None
+    p = Path(cwd) / ".codex" / "resume.md"
+    try:
+        text = p.read_text(errors="replace")
+    except OSError:
+        return None
+    if re.search(r"^\s*Status:\s*COMPLETE\s*$", text, re.M | re.I):
+        return "complete"
+    if re.search(r"^\s*Status:\s*IN[ _-]?PROGRESS\s*$", text, re.M | re.I):
+        return "in_progress"
+    return "unknown"
+
+
+# ----------------------------------------------------------------------------------- classification
+
+def classify(snap: dict, st: dict, cfg: dict):
+    """Return (verdict, reason). Verdicts: stop, complete, working, limited, continue, idle."""
+    if snap.get("missing"):
+        return "stop", "the thread no longer exists"
+    if snap.get("archived"):
+        return "stop", "the thread was archived"
+    latest = snap.get("latest")
+    goal = snap.get("goal")
+    gstatus = goal.get("status") if goal else None
+    goal_mode = st.get("mode") == "goal"
+    baseline = st.get("baseline_turn_id")
+
+    if goal_mode and not snap.get("goal_unknown"):
+        if goal is None:
+            return "complete", "the Codex goal finished (completed or cleared)"
+        if gstatus == "complete":
+            return "complete", "Codex marked the goal complete"
+        if gstatus in TERMINAL_GOAL_STOP:
+            return "stop", TERMINAL_GOAL_STOP[gstatus]
+
+    if latest is None:
+        return "idle", "no turns yet"
+    if latest["status"] == "inProgress":
+        return "working", "a turn is in progress"
+    if latest["error_code"] == "usageLimitExceeded":
+        if st.get("cancelled_turn_id") == latest["id"]:
+            return "idle", "scheduled resume was cancelled for this limit event"
+        return "limited", latest.get("error_message") or "usage limit reached"
+
+    pre_arm = latest["id"] == baseline
+    if latest["status"] == "interrupted":
+        return ("idle", "last turn (before arming) was interrupted") if pre_arm else \
+            ("stop", "the turn was interrupted (by you or Codex)")
+    if latest["status"] == "failed":
+        return ("idle", "last turn (before arming) failed") if pre_arm else \
+            ("stop", "Codex stopped with an error that is not a usage limit (%s)" % latest["error_code"])
+
+    # Latest turn completed normally.
+    if goal_mode:
+        if gstatus == "active":
+            if latest.get("completed_at") and now() - latest["completed_at"] > 1800:
+                return "idle", "goal is active but Codex has not continued it for 30+ minutes"
+            return "working", "goal is active; Codex continues it by itself"
+        if gstatus == "usageLimited":
+            if latest["by_helper"]:
+                return "continue", "goal still usage-limited after a resumed turn"
+            return "idle", "you interacted with the task; goal is still usage-limited"
+        return "working", "goal status %s" % gstatus
+    if pre_arm:
+        return "idle", "waiting for the task to run (last turn finished before arming)"
+    if st.get("checkpoint"):
+        cp = read_checkpoint(snap.get("cwd"))
+        if cp == "in_progress":
+            return "stop", "Codex ended its turn but the checkpoint says work remains"
+    return "complete", "Codex finished its turn normally"
+
+
+# -------------------------------------------------------------------------------------------- power
+
+class Caffeinate:
+    def __init__(self):
+        self.proc = None
+        self.mode = None
+
+    def set(self, mode):
+        if mode == self.mode and (self.proc is None or self.proc.poll() is None):
+            return
+        self.release()
+        if mode:
+            flag = {"working": "-i", "waiting": "-s"}[mode]
+            self.proc = subprocess.Popen(["/usr/bin/caffeinate", flag, "-w", str(os.getpid())])
+            log.info("power: holding %s assertion (%s)", flag, mode)
+        self.mode = mode
+
+    def release(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            log.info("power: released assertion")
+        self.proc, self.mode = None, None
+
+
+# ------------------------------------------------------------------------------------------ actions
+
+def build_prompt(st: dict, cfg: dict) -> str:
+    key = "goal_continuation_prompt" if st.get("mode") == "goal" else "continuation_prompt"
+    prompt = cfg[key]
+    if st.get("checkpoint"):
+        prompt += cfg["checkpoint_instruction"]
+    return prompt
+
+
+def codex_queue(cfg: dict, tid: str, message: str) -> str:
+    r = subprocess.run([cfg["codex_cli"], "queue", "--thread", tid, "--message", message],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("codex queue failed: %s" % (r.stderr or r.stdout).strip()[:300])
+    m = re.search(r"Queued message (\S+) for thread (\S+?)\.?$", r.stdout.strip(), re.M)
+    if not m or m.group(2) != tid:
+        raise RuntimeError("unexpected codex queue output: %s" % r.stdout.strip()[:200])
+    return m.group(1)
+
+
+def ensure_loaded(cfg: dict, tid: str) -> str:
+    holders = lock_holders(tid)
+    if holders:
+        return "loaded (pid %s)" % ",".join(map(str, holders))
+    running = codex_app_running(cfg)
+    subprocess.run(["/usr/bin/open", "-g", "codex://threads/%s" % tid], timeout=30)
+    return "opened via deep link (Codex was %s)" % ("running" if running else "not running; launched")
+
+
+def wait_for_owner(tid: str, timeout: float) -> bool:
+    deadline = now() + timeout
+    while now() < deadline:
+        if lock_holders(tid):
+            return True
+        time.sleep(3)
+    return False
+
+
+def reactivate_goal(cfg: dict, tid: str) -> str:
+    with AppServer(cfg["codex_cli"]) as srv:
+        g = srv.call("thread/goal/set", {"threadId": tid, "status": "active", "origin": "automatic"})
+    return (g.get("goal") or {}).get("status", "?")
+
+
+def do_resume(cfg: dict, st: dict, snap: dict, kind: str) -> None:
+    """Send exactly one continuation to the armed thread. Caller holds the state lock."""
+    tid = st["thread_id"]
+    if st.get("resume_count", 0) >= st.get("max_resumes", cfg["max_resumes"]):
+        stop(cfg, st, "safety stop: reached the maximum of %d automatic resumes" % st.get("max_resumes"))
+        return
+    pending = pending_queue_items(tid)
+    latest = snap.get("latest") or {}
+    # Make sure Codex Desktop (not this helper) owns the thread before touching it.
+    load_note = ensure_loaded(cfg, tid)
+    if st.get("mode") == "goal":
+        if wait_for_owner(tid, 45):
+            try:
+                add_event(st, "goal_reactivate", "status -> %s" % reactivate_goal(cfg, tid))
+            except Exception as e:
+                add_event(st, "goal_reactivate_failed", str(e)[:200])
+        else:
+            add_event(st, "goal_reactivate_skipped", "thread not loaded by Codex yet; sending message only")
+    if pending:
+        add_event(st, "queue_pending", "%d message(s) already queued for this thread; not adding another" % len(pending))
+        qid = pending[0]
+    else:
+        qid = codex_queue(cfg, tid, build_prompt(st, cfg))
+        st["resume_count"] = st.get("resume_count", 0) + 1
+    st.update(phase="resuming", resume_kind=kind, resume_queue_id=qid, resume_turn_before=latest.get("id"),
+              last_resume_at=now(), resume_deadline=now() + cfg["resume_verify_secs"], resume_attempts=1,
+              next_check_at=now() + cfg["poll_resuming_secs"])
+    add_event(st, "resume_sent", "%s #%d queue=%s; %s" % (kind, st.get("resume_count", 0), qid, load_note))
+
+
+def stop(cfg: dict, st: dict, reason: str, complete: bool = False) -> None:
+    st.update(armed=False, phase="complete" if complete else "stopped", stop_reason=reason, stopped_at=now())
+    add_event(st, "complete" if complete else "safety_stop", reason)
+    if complete:
+        notify(cfg, "Codex task completed", "%s. Auto-resume disarmed." % reason)
+    else:
+        notify(cfg, "Auto-resume stopped — intervention required", reason)
+
+
+# -------------------------------------------------------------------------------------- daemon tick
+
+def schedule_from_limit(cfg: dict, st: dict, latest: dict, rl: dict) -> None:
+    t = now()
+    candidates, source = [], None
+    if rl["reset_at"]:
+        candidates.append(rl["reset_at"]); source = "rate-limit window"
+    msg_ts = parse_try_again(latest.get("error_message"))
+    if msg_ts and msg_ts > t:
+        candidates.append(msg_ts); source = source or "Codex message"
+    level = st.get("backoff_level", 0)
+    backoff = cfg["backoff_secs"][min(level, len(cfg["backoff_secs"]) - 1)]
+    if candidates:
+        resume_at = max(candidates) + cfg["reset_grace_secs"]
+    elif rl["allowed"] is True:
+        resume_at, source = t + cfg["reset_grace_secs"], "usage already available"
+    else:
+        resume_at, source = t + backoff, "backoff (no reset time known)"
+    # A resume that immediately hit the limit again: never retry faster than the backoff step.
+    if st.get("last_resume_at") and t - st["last_resume_at"] < 900:
+        resume_at = max(resume_at, t + backoff)
+        st["backoff_level"] = level + 1
+        source += " + backoff after an immediate repeat limit"
+    st.update(phase="waiting_reset", reset_at=resume_at, reset_source=source,
+              next_check_at=min(resume_at, t + cfg["poll_waiting_secs"]))
+
+
+def tick(cfg: dict, caf: Caffeinate) -> float:
+    st = load_state()
+    if not st.get("armed"):
+        caf.release()
+        return 3600
+    gen, tid = st["generation"], st["thread_id"]
+    if now() < st.get("next_check_at", 0):
+        return st["next_check_at"] - now()
+
+    rl = None
+    try:
+        with AppServer(cfg["codex_cli"]) as srv:
+            snap = read_snapshot(srv, tid)
+            verdict, reason = classify(snap, st, cfg)
+            if verdict in ("limited", "continue") or st.get("phase") == "waiting_reset":
+                rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
+    except Exception as e:
+        with mutate_state() as s2:
+            if s2["generation"] == gen:
+                s2["consecutive_errors"] = s2.get("consecutive_errors", 0) + 1
+                s2["next_check_at"] = now() + min(60 * s2["consecutive_errors"], 600)
+                if s2["consecutive_errors"] in (1, 10):
+                    add_event(s2, "check_failed", str(e)[:200])
+                if s2["consecutive_errors"] == 30:
+                    notify(cfg, "Auto-resume can't read Codex state", "Still retrying. Last error: %s" % str(e)[:120])
+        return 60
+
+    with mutate_state() as s:
+        if s["generation"] != gen or not s.get("armed"):
+            return 1  # user changed something meanwhile; re-evaluate from scratch
+        s["consecutive_errors"] = 0
+        s["last_check_at"] = now()
+        s["last_verdict"], s["last_reason"] = verdict, reason
+        s["thread_title"] = snap.get("title") or s.get("thread_title")
+        s["goal_status"] = (snap.get("goal") or {}).get("status")
+        if s.get("mode") == "message" and s["goal_status"] not in (None, "complete"):
+            s["mode"] = "goal"
+            add_event(s, "mode_goal", "a Codex goal was added to the thread; tracking it")
+        latest = snap.get("latest") or {}
+        if rl:
+            s["rate_limits"] = rl
+        phase = s.get("phase")
+
+        if phase == "resuming":
+            if latest.get("id") and latest.get("id") != s.get("resume_turn_before"):
+                add_event(s, "resume_confirmed", "new turn %s started" % latest["id"][-12:])
+                if s.get("resume_kind") != "followup":
+                    notify(cfg, "Codex task resumed", s.get("thread_title") or tid)
+                s["phase"] = "working"
+            elif now() < s.get("resume_deadline", 0):
+                s["next_check_at"] = now() + cfg["poll_resuming_secs"]
+                caf.set("working" if cfg["keep_awake_while_working"] else None)
+                return cfg["poll_resuming_secs"]
+            elif s.get("resume_attempts", 1) < 2:
+                s["resume_attempts"] = 2
+                s["resume_deadline"] = now() + cfg["resume_verify_secs"]
+                s["next_check_at"] = now() + cfg["poll_resuming_secs"]
+                add_event(s, "resume_retry_open", ensure_loaded(cfg, tid))
+                return cfg["poll_resuming_secs"]
+            else:
+                pend = pending_queue_items(tid)
+                stop(cfg, s, "the continuation was queued but Codex did not start it%s" % (
+                    " (it will run when you open the thread in Codex)" if pend else ""))
+                caf.release()
+                return 3600
+
+        if verdict == "stop":
+            stop(cfg, s, reason)
+        elif verdict == "complete":
+            stop(cfg, s, reason, complete=True)
+        elif verdict == "working":
+            if phase != "working":
+                add_event(s, "working", reason)
+            if now() - (s.get("last_resume_at") or 0) > 900:
+                s["backoff_level"] = 0  # the last resume made real progress
+            s.update(phase="working", next_check_at=now() + cfg["poll_working_secs"])
+        elif verdict == "idle":
+            if phase != "idle":
+                add_event(s, "idle", reason)
+                if "interacted" in reason:
+                    notify(cfg, "Auto-resume on hold", "You interacted with the task while its goal was usage-limited. "
+                           "Use `codex-auto-resume resume-now` or Resume goal in Codex.")
+            s.update(phase="idle", next_check_at=now() + cfg["poll_idle_secs"])
+        elif verdict == "limited":
+            if s.get("limit_turn_id") != latest.get("id"):
+                s["limit_turn_id"] = latest.get("id")
+                s["limit_events"] = s.get("limit_events", 0) + 1
+                schedule_from_limit(cfg, s, latest, rl)
+                add_event(s, "usage_limit", "reset %s via %s" % (fmt_time(s["reset_at"]), s["reset_source"]))
+                notify(cfg, "Codex paused — usage limit reached",
+                       "Will resume at approximately %s." % fmt_time(s["reset_at"]))
+            else:
+                s["phase"] = "waiting_reset"
+                reset_at = s.get("reset_at") or 0
+                if rl["allowed"] is True and now() < reset_at - cfg["reset_grace_secs"]:
+                    # Usage came back early (e.g. you redeemed a reset); give it the normal grace period.
+                    s.update(reset_at=now() + cfg["reset_grace_secs"], reset_source="usage available early")
+                    add_event(s, "reset_early", "usage available again; resuming %s" % fmt_time(s["reset_at"]))
+                    s["next_check_at"] = s["reset_at"]
+                elif now() >= reset_at and rl["allowed"] is False:
+                    schedule_from_limit(cfg, s, latest, rl)
+                    add_event(s, "reset_rescheduled", "usage not yet available; next try %s" % fmt_time(s["reset_at"]))
+                elif now() >= reset_at:
+                    do_resume(cfg, s, snap, "after_limit")
+                else:
+                    s["next_check_at"] = min(reset_at, now() + cfg["poll_waiting_secs"])
+        elif verdict == "continue":
+            if rl and rl["allowed"] is False:
+                schedule_from_limit(cfg, s, latest, rl)
+                add_event(s, "usage_limit", "usage not available; resume %s" % fmt_time(s["reset_at"]))
+            else:
+                do_resume(cfg, s, snap, "followup")
+
+        # Power assertions follow the phase.
+        p = s.get("phase")
+        if p in ("working", "resuming") and cfg["keep_awake_while_working"]:
+            caf.set("working")
+        elif p == "waiting_reset" and cfg["keep_awake_while_waiting_on_ac"] and \
+                s.get("reset_at", 0) - now() < cfg["keep_awake_max_wait_secs"]:
+            caf.set("waiting")
+        else:
+            caf.set(None)
+        if not s.get("armed"):
+            caf.release()
+            return 3600
+        return max(1.0, s.get("next_check_at", now() + 60) - now())
+
+
+def run_daemon() -> int:
+    setup_logging(daemon=True)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    pid_f = open(APP_DIR / "daemon.lock", "a")
+    try:
+        fcntl.flock(pid_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another codex-auto-resume daemon is already running", file=sys.stderr)
+        return 0
+    PID_PATH.write_text(str(os.getpid()))
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
+    signal.set_wakeup_fd(wfd)
+    stopping = {"flag": False}
+
+    def on_term(*_):
+        stopping["flag"] = True
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    signal.signal(signal.SIGUSR1, lambda *_: None)
+    caf = Caffeinate()
+    log.info("daemon started (pid %d, version %s)", os.getpid(), VERSION)
+    while not stopping["flag"]:
+        cfg = load_config()
+        try:
+            wait = tick(cfg, caf)
+        except Exception as e:  # never die on a bad tick; launchd restarts us anyway if we do
+            log.exception("tick crashed: %s", e)
+            wait = 120
+        # Sleep in <=60s wall-clock chunks so a Mac that slept past the deadline notices on wake.
+        r, _, _ = select.select([rfd], [], [], max(1.0, min(wait, 60)))
+        if r:
+            try:
+                os.read(rfd, 512)
+            except OSError:
+                pass
+    caf.release()
+    log.info("daemon stopping")
+    with contextlib.suppress(Exception):
+        PID_PATH.unlink()
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ CLI
+
+def list_threads(cfg: dict, limit: int = 8) -> list:
+    with AppServer(cfg["codex_cli"]) as srv:
+        data = srv.call("thread/list", {"limit": 40}).get("data") or []
+    out = []
+    for t in data:
+        src = json.dumps(t.get("source"))
+        if "subagent" in src or t.get("threadSource") in ("guardian_review", "subagent") or t.get("parentThreadId"):
+            continue
+        out.append({"id": t["id"], "title": short_title(t), "updated": t.get("updatedAt"), "cwd": t.get("cwd")})
+    out.sort(key=lambda x: x["updated"] or 0, reverse=True)
+    return out[:limit]
+
+
+def resolve_thread(cfg: dict, ref: str) -> dict:
+    cands = list_threads(cfg, 40)
+    exact = [c for c in cands if c["id"] == ref or c["title"] == ref]
+    pref = [c for c in cands if c["id"].startswith(ref)]
+    hits = exact or pref
+    if len(hits) == 1:
+        return hits[0]
+    if not hits and re.fullmatch(r"[0-9a-f-]{36}", ref):
+        return {"id": ref, "title": "", "cwd": None}
+    raise SystemExit("No unique thread matches %r (%d matches). Run `codex-auto-resume threads`." % (ref, len(hits)))
+
+
+def cmd_threads(cfg, args):
+    for i, t in enumerate(list_threads(cfg, args.n)):
+        print("%s %s  %-11s  %s" % ("*" if i == 0 else " ", t["id"], fmt_time(t["updated"]), t["title"]))
+
+
+def cmd_arm(cfg, args):
+    if args.thread:
+        t = resolve_thread(cfg, args.thread)
+    else:
+        cands = list_threads(cfg, 5)
+        if not cands:
+            raise SystemExit("No Codex threads found.")
+        t = cands[0]
+        print("Most recently active Codex thread:\n  %s  %s\n  (cwd %s)" % (t["id"], t["title"], t["cwd"]))
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("Pass a thread id or --yes when not running interactively.")
+            if input("Arm auto-resume for this thread? [y/N] ").strip().lower() not in ("y", "yes"):
+                raise SystemExit("Not armed.")
+    with AppServer(cfg["codex_cli"]) as srv:
+        snap = read_snapshot(srv, t["id"])
+    if snap.get("missing") or snap.get("archived"):
+        raise SystemExit("That thread is missing or archived.")
+    goal = snap.get("goal")
+    mode = "goal" if goal and goal.get("status") != "complete" else "message"
+    if goal and goal.get("status") in TERMINAL_GOAL_STOP and not args.force:
+        raise SystemExit("The thread's goal is %s; resume it in Codex first (or pass --force)." % goal["status"])
+    latest = snap.get("latest")
+    with mutate_state() as st:
+        hist = st.get("history", [])
+        st.clear()
+        st.update(default_state())
+        st.update(history=hist, armed=True, phase="watching", generation=int(now() * 1000),
+                  thread_id=t["id"], thread_title=snap.get("title") or t["title"], cwd=snap.get("cwd"),
+                  mode=mode, checkpoint=bool(args.checkpoint), armed_at=now(),
+                  max_resumes=args.max_resumes or cfg["max_resumes"], resume_count=0, backoff_level=0,
+                  # A turn that had already finished (not via a usage limit) before arming is not "completion".
+                  baseline_turn_id=(latest or {}).get("id") if (latest or {}).get("status") in ("completed", "failed", "interrupted")
+                  and (latest or {}).get("error_code") != "usageLimitExceeded" else None,
+                  next_check_at=0)
+        add_event(st, "armed", "%s mode=%s max_resumes=%d checkpoint=%s" % (t["id"], mode, st["max_resumes"], st["checkpoint"]))
+    running = signal_daemon()
+    print("Armed: %s\n  %s\n  mode: %s%s, max resumes: %d" % (
+        t["id"], snap.get("title") or t["title"], mode,
+        " (Codex goal: %s)" % goal["status"] if goal else " (no Codex goal; tip: use /goal in Codex for native completion tracking)",
+        args.max_resumes or cfg["max_resumes"]))
+    if latest:
+        print("  latest turn: %s%s" % (latest["status"], " — %s" % latest["error_code"] if latest["error_code"] else ""))
+    if not running:
+        print("  warning: the background daemon is not running (see `codex-auto-resume doctor`).")
+
+
+def cmd_disarm(cfg, args):
+    with mutate_state() as st:
+        was = st.get("armed")
+        st.update(armed=False, phase="disarmed", generation=int(now() * 1000))
+        add_event(st, "disarmed", "by user")
+    signal_daemon()
+    print("Disarmed." if was else "Was not armed.")
+
+
+def cmd_cancel(cfg, args):
+    with mutate_state() as st:
+        if st.get("phase") not in ("waiting_reset", "resuming"):
+            print("Nothing scheduled (phase: %s)." % st.get("phase"))
+            return
+        st["cancelled_turn_id"] = st.get("limit_turn_id")
+        st.update(phase="idle", generation=int(now() * 1000), next_check_at=0)
+        add_event(st, "cancelled", "scheduled resume cancelled; still armed for future limit events")
+    signal_daemon()
+    print("Scheduled resume cancelled. Still armed for future usage-limit events (use `disarm` to stop entirely).")
+
+
+def cmd_resume_now(cfg, args):
+    st = load_state()
+    if not st.get("armed"):
+        raise SystemExit("Not armed. Arm a thread first.")
+    with AppServer(cfg["codex_cli"]) as srv:
+        snap = read_snapshot(srv, st["thread_id"])
+        rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
+    verdict, reason = classify(snap, st, cfg)
+    if verdict in ("stop", "complete"):
+        raise SystemExit("Refusing: %s." % reason)
+    if verdict == "working":
+        raise SystemExit("Codex is already working on this thread (%s)." % reason)
+    if verdict == "idle" and not (args.force or args.yes):
+        if not sys.stdin.isatty():
+            raise SystemExit("Codex is not stopped at a usage limit (%s). Pass --yes to send anyway." % reason)
+        if input("Codex is not stopped at a usage limit (%s).\nIt may already be finished. Send the continuation anyway? [y/N] "
+                 % reason).strip().lower() not in ("y", "yes"):
+            raise SystemExit("Nothing sent.")
+    if rl["allowed"] is False and not args.force:
+        raise SystemExit("Codex reports usage is not available yet (reset %s). Use --force to send anyway." % fmt_time(rl["reset_at"]))
+    with mutate_state() as s:
+        if s["generation"] != st["generation"]:
+            raise SystemExit("State changed meanwhile; try again.")
+        s["generation"] = int(now() * 1000)
+        add_event(s, "resume_now", "requested by user")
+        do_resume(cfg, s, snap, "manual")
+    signal_daemon()
+    print("Continuation sent to %s." % st["thread_id"])
+
+
+def cmd_status(cfg, args):
+    st = load_state()
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return
+    pid = daemon_pid()
+    print("daemon:   %s" % ("running (pid %d)" % pid if pid else "NOT RUNNING"))
+    print("armed:    %s   phase: %s" % ("yes" if st.get("armed") else "no", st.get("phase")))
+    if st.get("thread_id"):
+        print("thread:   %s  %s" % (st["thread_id"], st.get("thread_title") or ""))
+        print("mode:     %s%s%s" % (st.get("mode"), "  goal=%s" % st["goal_status"] if st.get("goal_status") else "",
+                                    "  checkpoint=on" if st.get("checkpoint") else ""))
+        print("resumes:  %d / %d   limit events: %d" % (st.get("resume_count", 0), st.get("max_resumes", 0), st.get("limit_events", 0)))
+    if st.get("last_check_at"):
+        print("checked:  %s ago — %s: %s" % (fmt_delta(now() - st["last_check_at"]), st.get("last_verdict"), st.get("last_reason")))
+    if st.get("phase") == "waiting_reset":
+        print("resume:   ~%s (in %s; %s)" % (fmt_time(st.get("reset_at")), fmt_delta(st.get("reset_at", 0) - now()), st.get("reset_source")))
+    if st.get("armed") and st.get("next_check_at"):
+        print("next:     check in %s" % fmt_delta(st["next_check_at"] - now()))
+    if st.get("stop_reason") and not st.get("armed"):
+        print("stopped:  %s" % st["stop_reason"])
+    rl = st.get("rate_limits")
+    if rl and rl.get("windows"):
+        print("limits:   " + "; ".join("%s %s%% resets %s" % (w["window"], w["used"], fmt_time(w["resets_at"])) for w in rl["windows"][:2]))
+    for ev in st.get("history", [])[-args.n:]:
+        print("  %s  %-18s %s" % (dt.datetime.fromtimestamp(ev["ts"]).strftime("%m-%d %H:%M"), ev["event"], ev["detail"]))
+
+
+def cmd_check(cfg, args):
+    """Dry run: show exactly what the helper would decide right now. Sends nothing."""
+    st = load_state()
+    tid = resolve_thread(cfg, args.thread)["id"] if args.thread else st.get("thread_id")
+    if not tid:
+        raise SystemExit("Not armed; pass a thread id.")
+    probe = dict(st) if st.get("thread_id") == tid else {"mode": None}
+    with AppServer(cfg["codex_cli"]) as srv:
+        snap = read_snapshot(srv, tid)
+        rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
+    if probe.get("mode") is None:
+        probe["mode"] = "goal" if snap.get("goal") else "message"
+        latest = snap.get("latest") or {}
+        probe["baseline_turn_id"] = latest.get("id") if latest.get("status") in ("completed", "failed", "interrupted") \
+            and latest.get("error_code") != "usageLimitExceeded" else None
+    verdict, reason = classify(snap, probe, cfg)
+    print("thread:     %s  %s" % (tid, snap.get("title")))
+    print("archived:   %s   goal: %s" % (snap.get("archived"), (snap.get("goal") or {}).get("status")))
+    for t in snap.get("turns", []):
+        print("turn:       %s %-11s %s%s" % (t["id"][-12:], t["status"], t["error_code"] or "", "  (sent by helper)" if t["by_helper"] else ""))
+    print("loaded by:  %s" % (lock_holders(tid) or "nobody (would deep-link)"))
+    print("queued:     %s" % pending_queue_items(tid))
+    print("usage:      allowed=%s  exhausted-window reset=%s" % (rl["allowed"], fmt_time(rl["reset_at"])))
+    if snap.get("latest") and snap["latest"].get("error_message"):
+        print("limit msg:  try-again parsed as %s" % fmt_time(parse_try_again(snap["latest"]["error_message"])))
+    print("verdict:    %s — %s" % (verdict, reason))
+
+
+def cmd_logs(cfg, args):
+    if not LOG_PATH.exists():
+        raise SystemExit("No log yet at %s" % LOG_PATH)
+    if args.follow:
+        os.execv("/usr/bin/tail", ["tail", "-n", str(args.n), "-F", str(LOG_PATH)])
+    lines = LOG_PATH.read_text(errors="replace").splitlines()[-args.n:]
+    print("\n".join(lines))
+
+
+def cmd_reset(cfg, args):
+    with mutate_state() as st:
+        st.clear()
+        st.update(default_state())
+        st["generation"] = int(now() * 1000)
+        add_event(st, "reset", "state cleared by user")
+    signal_daemon()
+    print("State reset (disarmed, history cleared).")
+
+
+def cmd_config(cfg, args):
+    if not args.key:
+        print(json.dumps(cfg, indent=2))
+        return
+    if args.value is None:
+        print(json.dumps(cfg.get(args.key)))
+        return
+    if args.key not in DEFAULT_CONFIG:
+        raise SystemExit("Unknown key %r" % args.key)
+    try:
+        val = json.loads(args.value)
+    except ValueError:
+        val = args.value
+    user = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+    user[args.key] = val
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(user, indent=2))
+    signal_daemon()
+    print("%s = %s" % (args.key, json.dumps(val)))
+
+
+def cmd_doctor(cfg, args):
+    ok = True
+    def line(good, text):
+        nonlocal ok
+        ok = ok and good
+        print("%s %s" % ("✓" if good else "✗", text))
+    line(os.path.exists(cfg["codex_cli"]), "Codex CLI: %s" % cfg["codex_cli"])
+    line(daemon_pid() is not None, "daemon running (launchd label %s)" % LABEL)
+    line(codex_app_running(cfg), "Codex Desktop running (not required; it is launched when needed)")
+    try:
+        with AppServer(cfg["codex_cli"]) as srv:
+            rl = analyze_rate_limits(srv.call("account/rateLimits/read"))
+        line(True, "app-server reachable; usage allowed=%s" % rl["allowed"])
+    except Exception as e:
+        line(False, "app-server: %s" % e)
+    line(pending_queue_items("00000000-0000-0000-0000-000000000000") is not None, "Codex queue database readable")
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="codex-auto-resume", description="Auto-resume Codex Desktop tasks after usage limits reset.")
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("status", help="show state"); p.add_argument("--json", action="store_true"); p.add_argument("-n", type=int, default=8)
+    p = sub.add_parser("arm", help="arm auto-resume for a Codex thread (default: most recent)")
+    p.add_argument("thread", nargs="?", help="thread id, id prefix, or exact thread name")
+    p.add_argument("--max-resumes", type=int); p.add_argument("--checkpoint", action="store_true",
+                   help="ask Codex to keep .codex/resume.md and use it as a completion signal")
+    p.add_argument("--yes", "-y", action="store_true"); p.add_argument("--force", action="store_true")
+    sub.add_parser("disarm", help="stop watching immediately")
+    sub.add_parser("cancel", help="cancel the scheduled resume (stay armed)")
+    p = sub.add_parser("resume-now", help="send the continuation now")
+    p.add_argument("--force", action="store_true", help="send even if Codex reports usage is unavailable")
+    p.add_argument("--yes", "-y", action="store_true", help="don't ask when Codex isn't stopped at a usage limit")
+    p = sub.add_parser("logs", help="show the log"); p.add_argument("-f", "--follow", action="store_true"); p.add_argument("-n", type=int, default=40)
+    sub.add_parser("reset", help="clear all stored state")
+    p = sub.add_parser("check", help="dry-run: show what the helper would decide (sends nothing)"); p.add_argument("thread", nargs="?")
+    p = sub.add_parser("threads", help="list recent Codex threads"); p.add_argument("-n", type=int, default=8)
+    p = sub.add_parser("config", help="show/set config"); p.add_argument("key", nargs="?"); p.add_argument("value", nargs="?")
+    sub.add_parser("doctor", help="check installation")
+    p = sub.add_parser("notify-test", help="send a test notification")
+    sub.add_parser("daemon", help="run the background loop (used by launchd)")
+    args = ap.parse_args(argv)
+    if args.cmd == "daemon":
+        return run_daemon()
+    setup_logging(daemon=False)
+    cfg = load_config()
+    fn = {"status": cmd_status, "arm": cmd_arm, "disarm": cmd_disarm, "cancel": cmd_cancel,
+          "resume-now": cmd_resume_now, "logs": cmd_logs, "reset": cmd_reset, "check": cmd_check,
+          "threads": cmd_threads, "config": cmd_config, "doctor": cmd_doctor,
+          "notify-test": lambda c, a: notify(c, "Test notification", "Notifications are working.")}.get(args.cmd)
+    if fn is None:
+        ap.print_help()
+        return 0
+    try:
+        return fn(cfg, args) or 0
+    except AppServerError as e:
+        print("Could not talk to Codex: %s" % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
